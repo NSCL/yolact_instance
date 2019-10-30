@@ -20,6 +20,8 @@ import numpy as np
 import argparse
 import datetime
 
+from PIL import Image
+
 # Oof
 import eval as eval_script
 
@@ -129,10 +131,17 @@ def train():
     if not os.path.exists(args.save_folder):
         os.mkdir(args.save_folder)
 
+    
     dataset = COCODetection(image_path=cfg.dataset.train_images,
                             info_file=cfg.dataset.train_info,
                             transform=SSDAugmentation(MEANS))
-    
+    '''
+    dataset = COCODetection(image_path=cfg.dataset.train_images,
+                            info_file=cfg.dataset.train_info,
+                            transform=BaseTransform(MEANS))
+    '''
+
+
     if args.validation_epoch > 0:
         setup_eval()
         val_dataset = COCODetection(image_path=cfg.dataset.valid_images,
@@ -246,7 +255,8 @@ def train():
                 # Load training data
                 # Note, for training on multiple gpus this will use the custom replicate and gather I wrote up there
                 images, targets, masks, num_crowds = prepare_data(datum)
-                
+              
+
                 # Forward Pass
                 out = net(images)
                 

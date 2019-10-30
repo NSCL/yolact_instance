@@ -126,113 +126,6 @@ coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
 
-def prep_display_mask(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45):
-    """
-    Note: If undo_transform=False then im_h and im_w are allowed to be None.
-    """
-    if undo_transform:
-        img_numpy = undo_image_transformation(img, w, h)
-        img_gpu = torch.Tensor(img_numpy).cuda()
-    else:
-        img_gpu = img / 255.0
-        h, w, _ = img.shape
-
-    with timer.env('Postprocess'):
-        t = postprocess(dets_out, w, h, visualize_lincomb = args.display_lincomb,
-                                        crop_masks        = args.crop,
-                                        score_threshold   = args.score_threshold)
-        torch.cuda.synchronize()
-
-    with timer.env('Copy'):
-        if cfg.eval_mask_branch:
-            # Masks are drawn on the GPU, so don't copy
-            masks = t[3][:args.top_k]
-            #print(masks.)
-        classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in t[:3]]
-
-    num_dets_to_consider = min(args.top_k, classes.shape[0])
-    for j in range(num_dets_to_consider):
-        if scores[j] < args.score_threshold:
-            num_dets_to_consider = j
-            break
-    
-    if num_dets_to_consider == 0:
-        # No detections found so just output the original image
-        return (img_gpu * 255).byte().cpu().numpy()
-
-    # Quick and dirty lambda for selecting the color for a particular index
-    # Also keeps track of a per-gpu color cache for maximum speed
-    def get_color(j, on_gpu=None):
-        global color_cache
-        color_idx = (classes[j] * 5 if class_color else j * 5) % len(COLORS)
-        
-        if on_gpu is not None and color_idx in color_cache[on_gpu]:
-            return color_cache[on_gpu][color_idx]
-        else:
-            color = COLORS[color_idx]
-            if not undo_transform:
-                # The image might come in as RGB or BRG, depending
-                color = (color[2], color[1], color[0])
-            if on_gpu is not None:
-                color = torch.Tensor(color).to(on_gpu).float() / 255.
-                color_cache[on_gpu][color_idx] = color
-            return color
-
-    # First, draw the masks on the GPU where we can do it really fast
-    # Beware: very fast but possibly unintelligible mask-drawing code ahead
-    # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if args.display_masks and cfg.eval_mask_branch:
-        # After this, mask is of size [num_dets, h, w, 1]
-        masks = masks[:num_dets_to_consider, :, :, None]
-        
-        # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
-        colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
-        masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
-
-        # This is 1 everywhere except for 1-mask_alpha where the mask is
-        inv_alph_masks = masks * (-mask_alpha) + 1
-        
-        # I did the math for this on pen and paper. This whole block should be equivalent to:
-        #    for j in range(num_dets_to_consider):
-        #        img_gpu = img_gpu * inv_alph_masks[j] + masks_color[j]
-        masks_color_summand = masks_color[0]
-        if num_dets_to_consider > 1:
-            inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
-            masks_color_cumul = masks_color[1:] * inv_alph_cumul
-            masks_color_summand += masks_color_cumul.sum(dim=0)
-
-        img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-        
-    # Then draw the stuff that needs to be done on the cpu
-    # Note, make sure this is a uint8 tensor or opencv will not anti alias text for whatever reason
-    img_numpy = (img_gpu * 255).byte().cpu().numpy()
-    
-    if args.display_text or args.display_bboxes:
-        for j in reversed(range(num_dets_to_consider)):
-            x1, y1, x2, y2 = boxes[j, :]
-            color = get_color(j)
-            score = scores[j]
-
-            if args.display_bboxes:
-                cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
-
-            if args.display_text:
-                _class = cfg.dataset.class_names[classes[j]]
-                text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
-
-                font_face = cv2.FONT_HERSHEY_DUPLEX
-                font_scale = 0.6
-                font_thickness = 1
-
-                text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
-
-                text_pt = (x1, y1 - 3)
-                text_color = [255, 255, 255]
-
-                cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
-                cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
-    
-    return img_numpy, masks #check point
 
 def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45):
     """
@@ -293,6 +186,28 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:num_dets_to_consider, :, :, None]
         
+        mask_data = masks.cpu()
+        mask_data = mask_data.numpy()
+        mask_data = mask_data.astype(np.int64)
+    
+        cen_mass_x = []
+        cen_mass_y = []
+        theta = []
+        mask_count = 0
+
+        for i in range(0, mask_data.shape[0]):
+
+            cx, cy, thetamin = mask_instance(mask_data[i,:,:,:])
+            cen_mass_x.append(cx)
+            cen_mass_y.append(cy)
+            theta.append(thetamin)
+
+            print("---------------------------------------------------")
+            print("theta : {}, center of mass : {}, {}".format(thetamin,cx,cy))
+            print("---------------------------------------------------")
+
+            mask_count += 1
+
         # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
         colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
         masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
@@ -316,31 +231,239 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     img_numpy = (img_gpu * 255).byte().cpu().numpy()
     
     if args.display_text or args.display_bboxes:
+
         for j in reversed(range(num_dets_to_consider)):
             x1, y1, x2, y2 = boxes[j, :]
             color = get_color(j)
             score = scores[j]
+            
+            if (x2-x1) > (y2-y1):
+                line_len = (x2-x1)*3/5
+            else:
+                line_len = (y2-y1)*3/5
+
+            point_x = line_len*math.sin(theta[j])
+            point_y = line_len*math.cos(theta[j])
+
+            point_2_x = line_len*math.sin(theta[j]+3.14)
+            point_2_y = line_len*math.cos(theta[j]+3.14)
+
+            rotation_point_x = cen_mass_x[j] - point_x
+            rotation_point_y = cen_mass_y[j] - point_y
+
+            rotation_point_2_x = cen_mass_x[j] - point_2_x
+            rotation_point_2_y = cen_mass_y[j] - point_2_y
+
+            rotation_point_x = int(rotation_point_x)
+            rotation_point_y = int(rotation_point_y)
+    
+            rotation_point_2_x = int(rotation_point_2_x)
+            rotation_point_2_y = int(rotation_point_2_y)
+
+            cv2.line(img_numpy, (rotation_point_y, rotation_point_x), (rotation_point_2_y,rotation_point_2_x), (0,255,0),2)
+            cv2.circle(img_numpy, (cen_mass_y[j], cen_mass_x[j]), 4, (0,0,255), 2)
 
             if args.display_bboxes:
-                cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
+                cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 2)
 
             if args.display_text:
                 _class = cfg.dataset.class_names[classes[j]]
                 text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
+                theta_text_str = 'theta: %.2f [rad]' % theta[j]
 
                 font_face = cv2.FONT_HERSHEY_DUPLEX
-                font_scale = 0.6
+                font_scale = 0.5
                 font_thickness = 1
 
                 text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
 
-                text_pt = (x1, y1 - 3)
+                theta_text_pt = (x1, y1 - 2)
+                text_pt = (x1, y1 - 18)
                 text_color = [255, 255, 255]
 
-                cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
+                cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 19), color, -1)
+
+                cv2.putText(img_numpy, theta_text_str, theta_text_pt, font_face, 0.4, text_color, font_thickness, cv2.LINE_AA)
                 cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
     
     return img_numpy #check point
+
+def prep_mask_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45):
+    """
+    Note: If undo_transform=False then im_h and im_w are allowed to be None.
+    """
+    if undo_transform:
+        img_numpy = undo_image_transformation(img, w, h)
+        img_gpu = torch.Tensor(img_numpy).cuda()
+    else:
+        img_gpu = img / 255.0
+        h, w, _ = img.shape
+
+    with timer.env('Postprocess'):
+        t = postprocess(dets_out, w, h, visualize_lincomb = args.display_lincomb,
+                                        crop_masks        = args.crop,
+                                        score_threshold   = args.score_threshold)
+        torch.cuda.synchronize()
+
+    with timer.env('Copy'):
+        if cfg.eval_mask_branch:
+            # Masks are drawn on the GPU, so don't copy
+            masks = t[3][:args.top_k]
+            #print(masks.)
+        classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in t[:3]]
+
+    num_dets_to_consider = min(args.top_k, classes.shape[0])
+    for j in range(num_dets_to_consider):
+        if scores[j] < args.score_threshold:
+            num_dets_to_consider = j
+            break
+    
+    if num_dets_to_consider == 0:
+        # No detections found so just output the original image
+        return (img_gpu * 255).byte().cpu().numpy()
+
+    # Quick and dirty lambda for selecting the color for a particular index
+    # Also keeps track of a per-gpu color cache for maximum speed
+    def get_color(j, on_gpu=None):
+        global color_cache
+        color_idx = (classes[j] * 5 if class_color else j * 5) % len(COLORS)
+        
+        if on_gpu is not None and color_idx in color_cache[on_gpu]:
+            return color_cache[on_gpu][color_idx]
+        else:
+            color = COLORS[color_idx]
+            if not undo_transform:
+                # The image might come in as RGB or BRG, depending
+                color = (color[2], color[1], color[0])
+            if on_gpu is not None:
+                color = torch.Tensor(color).to(on_gpu).float() / 255.
+                color_cache[on_gpu][color_idx] = color
+            return color
+
+    # First, draw the masks on the GPU where we can do it really fast
+    # Beware: very fast but possibly unintelligible mask-drawing code ahead
+    # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
+    if args.display_masks and cfg.eval_mask_branch:
+        # After this, mask is of size [num_dets, h, w, 1]
+        masks = masks[:num_dets_to_consider, :, :, None]
+        
+        mask_data = masks.cpu()
+        mask_data = mask_data.numpy()
+        mask_data = mask_data.astype(np.int64)
+    
+        cen_mass_x = []
+        cen_mass_y = []
+        theta = []
+        mask_count = 0
+
+        for i in range(0, mask_data.shape[0]):
+
+            cx, cy, thetamin = mask_instance(mask_data[i,:,:,:])
+            cen_mass_x.append(cx)
+            cen_mass_y.append(cy)
+            theta.append(thetamin)
+
+            print("---------------------------------------------------")
+            print("theta : {}, center of mass : {}, {}".format(thetamin,cx,cy))
+            print("---------------------------------------------------")
+
+            mask_count += 1
+
+        # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
+        colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
+        masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
+
+        # This is 1 everywhere except for 1-mask_alpha where the mask is
+        inv_alph_masks = masks * (-mask_alpha) + 1
+        
+        # I did the math for this on pen and paper. This whole block should be equivalent to:
+        #    for j in range(num_dets_to_consider):
+        #        img_gpu = img_gpu * inv_alph_masks[j] + masks_color[j]
+        masks_color_summand = masks_color[0]
+        if num_dets_to_consider > 1:
+            inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
+            masks_color_cumul = masks_color[1:] * inv_alph_cumul
+            masks_color_summand += masks_color_cumul.sum(dim=0)
+
+        img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
+
+
+    # Then draw the stuff that needs to be done on the cpu
+    # Note, make sure this is a uint8 tensor or opencv will not anti alias text for whatever reason
+    img_numpy = (img_gpu * 255).byte().cpu().numpy()
+    
+    mask_result = []
+
+    if args.display_text or args.display_bboxes:
+
+        for j in reversed(range(num_dets_to_consider)):
+
+            mask_img = masks_color[j,:,:,:].cpu().numpy().astype(np.int64)
+
+            x1, y1, x2, y2 = boxes[j, :]
+            color = get_color(j)
+            score = scores[j]
+            
+            if (x2-x1) > (y2-y1):
+                line_len = (x2-x1)*3/5
+            else:
+                line_len = (y2-y1)*3/5
+
+            point_x = line_len*math.sin(theta[j])
+            point_y = line_len*math.cos(theta[j])
+
+            point_2_x = line_len*math.sin(theta[j]+3.14)
+            point_2_y = line_len*math.cos(theta[j]+3.14)
+
+            rotation_point_x = cen_mass_x[j] - point_x
+            rotation_point_y = cen_mass_y[j] - point_y
+
+            rotation_point_2_x = cen_mass_x[j] - point_2_x
+            rotation_point_2_y = cen_mass_y[j] - point_2_y
+
+            rotation_point_x = int(rotation_point_x)
+            rotation_point_y = int(rotation_point_y)
+    
+            rotation_point_2_x = int(rotation_point_2_x)
+            rotation_point_2_y = int(rotation_point_2_y)
+
+            cv2.line(img_numpy, (rotation_point_y, rotation_point_x), (rotation_point_2_y,rotation_point_2_x), (0,255,0),2)
+            cv2.line(mask_img, (rotation_point_y, rotation_point_x), (rotation_point_2_y,rotation_point_2_x), (0,255,0),2)
+            cv2.circle(img_numpy, (cen_mass_y[j], cen_mass_x[j]), 4, (0,0,255), 2)
+            cv2.circle(mask_img, (cen_mass_y[j], cen_mass_x[j]), 4, (0,0,255), 2)
+
+            if args.display_bboxes:
+                cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 2)
+
+            if args.display_text:
+                _class = cfg.dataset.class_names[classes[j]]
+                text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
+                theta_text_str = 'theta: %.2f [rad]' % theta[j]
+
+                font_face = cv2.FONT_HERSHEY_DUPLEX
+                font_scale = 0.5
+                font_thickness = 1
+
+                text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
+
+                theta_text_pt = (x1, y1 - 2)
+                text_pt = (x1, y1 - 18)
+                text_color = [255, 255, 255]
+
+                cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 19), color, -1)
+
+                cv2.putText(img_numpy, theta_text_str, theta_text_pt, font_face, 0.4, text_color, font_thickness, cv2.LINE_AA)
+                cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
+
+                cv2.rectangle(mask_img, (x1, y1), (x1 + text_w, y1 - text_h - 19), color, -1)
+
+                cv2.putText(mask_img, theta_text_str, theta_text_pt, font_face, 0.4, text_color, font_thickness, cv2.LINE_AA)
+                cv2.putText(mask_img, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
+            
+            mask_result.append(mask_data[j,:,:,:]*255)
+    
+    return img_numpy, mask_result #check point
+
 
 def prep_benchmark(dets_out, h, w):
     with timer.env('Postprocess'):
@@ -667,38 +790,15 @@ def badhash(x):
     x =  ((x >> 16) ^ x) & 0xFFFFFFFF
     return x
 
-
-
-def evalimage(net:Yolact, path:str, save_path:str=None):
-    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
-    batch = FastBaseTransform()(frame.unsqueeze(0))
-    preds = net(batch)
-
-    img_numpy, mask = prep_display_mask(preds, frame, None, None, undo_transform=False)
+def mask_instance(mask_data):
     
-    '''
-    h,w,_ = frame.shape
-
-    t = postprocess(preds, w, h, visualize_lincomb = args.display_lincomb,
-                                    crop_masks        = args.crop,
-                                    score_threshold   = args.score_threshold)
-
-    mask = t[3][:args.top_k]
-    '''
-
-    mask_data = mask.cpu()
-    mask_data = mask_data.numpy()
-    mask_data = mask_data.astype(np.int64)
-    mask_data = mask_data * 100
-    
-
     mask_h_sum = 0
     mask_w_sum = 0
     sum_count = 0
 
-    for i in range(0,mask_data.shape[1]):
-        for j in range(0,mask_data.shape[2]):
-            if mask_data[0,i,j,0] != 0:
+    for i in range(0,mask_data.shape[0]):
+        for j in range(0,mask_data.shape[1]):
+            if mask_data[i,j,0] != 0:
                 mask_h_sum += i
                 mask_w_sum += j
                 sum_count += 1
@@ -710,14 +810,11 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     mask_w_index = int(mask_w)
 
     print("-----------------------------")
-
     print("center of mass x :",mask_h_index)
     print("center of mass y :",mask_w_index)
 
-    mask_data[0,mask_h_index,mask_w_index,0] = 255
-
-    img = mask_data[0,:,:,0]
-    img = mask_data[0,:,:,0]
+    img = mask_data[:,:,0]
+    img = mask_data[:,:,0]
   
     rows = img.shape[0]
     cols = img.shape[1]
@@ -774,27 +871,30 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
         lmax = 0.5*(c+a) - 0.5*(a-c)*cos2thetamax - 0.5*b*sin2thetamax
 
         roundness = lmin/lmax
+
+    return mask_h_index, mask_w_index, thetamin
+
+def evalimage(net:Yolact, path:str, save_path:str=None):
+    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
+    batch = FastBaseTransform()(frame.unsqueeze(0))
+    preds = net(batch)
     
-    print("-----------------------------")
-
-    print("thetamin",thetamin)
-
-    print("-----------------------------")
-
-    point_x = 50*math.sin(thetamin)
-    point_y = 50*math.cos(thetamin)
-
-    rotation_point_x = mask_h_index - point_x
-    rotation_point_y = mask_w_index - point_y
-
-    rotation_point_x = int(rotation_point_x)
-    rotation_point_y = int(rotation_point_y)
+    #img_numpy = prep_display(preds, frame, None, None, undo_transform=False)
+    img_numpy, mask_list = prep_mask_display(preds, frame, None, None, undo_transform=False)
     
-    mask_data[0,rotation_point_x,rotation_point_y,0] = 255
+    #mask_img = mask_img.numpy()
 
-    #print(point_x, point_y)
-    #print(meanx, meany)
-    #print(rotation_point_x, rotation_point_y)
+    print(len(mask_list))
+
+    for i in range(0, len(mask_list)):
+        mask_img = mask_list[i]
+        save_mask_img = mask_img
+
+        name = save_path.split('.')[0]
+        file_type = save_path.split('.')[1]
+
+        mask_path = name + str(i) + ".png"
+        cv2.imwrite(mask_path, save_mask_img)
     
     if save_path is None:
         img_numpy = img_numpy[:, :, (2, 1, 0)]
@@ -805,7 +905,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
         plt.show()
     else:
         cv2.imwrite(save_path, img_numpy)
-        cv2.imwrite(save_path, mask_data[0,:,:,:])
+       # 
     
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str):
@@ -876,6 +976,7 @@ def evalvideo(net:Yolact, path:str):
     def prep_frame(inp):
         with torch.no_grad():
             frame, preds = inp
+            #img, mask = 
             return prep_display(preds, frame, None, None, undo_transform=False, class_color=True)
 
 
@@ -928,7 +1029,7 @@ def evalvideo(net:Yolact, path:str):
     print('Initializing model... ', end='')
     eval_network(transform_frame(get_next_frame(vid)))
     print('Done.')
-
+    print(prep_frame)
     # For each frame the sequence of functions it needs to go through to be processed (in reversed order)
     sequence = [prep_frame, eval_network, transform_frame]
     pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
@@ -1046,8 +1147,6 @@ def evaluate(net:Yolact, dataset, train_mode=False):
     frame_times = MovingAverage()
     dataset_size = len(dataset) if args.max_images < 0 else min(args.max_images, len(dataset))
     progress_bar = ProgressBar(30, dataset_size)
-
-    print()
 
     if not args.display and not args.benchmark:
         # For each class and iou, stores tuples (score, isPositive)

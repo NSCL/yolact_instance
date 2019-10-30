@@ -496,72 +496,26 @@ class RandomRotation(object):
 
             boxes = boxes.copy()
             #bbox = np.zeros(boxes.shape, dtype=np.float32)
-          
+
             for i in range(0, masks.shape[0]):
                 m = masks[i, :, :]
                 # Bounding box.
-                check_flag = 0
-                x11 = 0
-                y11 = 0
-                x12 = 0
-                y12 = 0
                 
-                for k in range(0, m.shape[0]):
-                    for j in range(0, m.shape[1]):
-                        if m[k,j] != 0:
-                            check_flag = 1
-                            x11 = k
-                            break
-                    if check_flag == 1:
-                        break
+                horizontal_indicies = np.where(np.any(m, axis=0))[0]
+                vertical_indicies = np.where(np.any(m, axis=1))[0]
                 
-                check_flag = 0
+                if horizontal_indicies.shape[0]:
+                    x1, x2 = horizontal_indicies[[0, -1]]
+                    y1, y2 = vertical_indicies[[0, -1]]
+                    # x2 and y2 should not be part of the box. Increment by 1.
+                    x2 += 1
+                    y2 += 1
+                else:
+                    # No mask for this instance. Might happen due to
+                    # resizing or cropping. Set bbox to zeros
+                    x1, x2, y1, y2 = 0, 0, 0, 0
 
-                for k in range(0, m.shape[1]):
-                    for j in range(0, m.shape[0]):
-                        if m[j,k] != 0:
-                            check_flag = 1
-                            y11 = k
-                            break
-                    if check_flag == 1:
-                        break
-                
-                check_flag = 0
-
-                for k in range(0,m.shape[0]):
-                    q = m.shape[0] - k - 1
-                    for j in range(0,m.shape[1]):
-                        p = m.shape[1] - j - 1
-                        if m[q,p] != 0:
-                            check_flag = 1
-                            x12 = q
-                            break
-                    if check_flag == 1:
-                        break
-                
-                check_flag = 0
-
-                for k in range(0, m.shape[1]):
-                    q = m.shape[1] - k -1
-                    for j in range(0,m.shape[0]):
-                        p = m.shape[0] - j -1 
-
-                        if m[p,q] != 0:
-                            check_flag = 1
-                            y12 = q
-                            break
-                    if check_flag == 1:
-                        break
-                
-                check_flag = 0
-
-                #print("bbox_made", x11, x12, y11, y12)
-                            
-                boxes[i,0] = x11
-                boxes[i,1] = y11
-                boxes[i,2] = x12
-                boxes[i,3] = y12 
-
+                boxes[i] = np.array([y1, x1, y2, x2])
 
         return image, masks, boxes, labels
 
@@ -760,13 +714,13 @@ class SSDAugmentation(object):
             ConvertFromInts(),
             ToAbsoluteCoords(),
             enable_if(cfg.augment_photometric_distort, PhotometricDistort()),
-            enable_if(cfg.augment_photometric_distort, RandomBrightness(delta = random.randint(50,200))),
+            #enable_if(cfg.augment_photometric_distort, RandomBrightness(delta = random.randint(50,200))),
             enable_if(cfg.augment_expand, Expand(mean)),
             enable_if(cfg.augment_random_sample_crop, RandomSampleCrop()),
-            #enable_if(cfg.augment_random_mirror, RandomMirror()),
+            enable_if(cfg.augment_random_mirror, RandomMirror()),
             enable_if(cfg.augment_random_flip, RandomFlip()),
-            enable_if(cfg.augment_random_flip, RandomRotation()),
-            #enable_if(cfg.augment_random_flip, RandomRot90()),
+            #enable_if(cfg.augment_random_flip, RandomRotation()),
+            enable_if(cfg.augment_random_flip, RandomRot90()),
             Resize(),
             enable_if(not cfg.preserve_aspect_ratio, Pad(cfg.max_size, cfg.max_size, mean)),
             ToPercentCoords(),
@@ -775,28 +729,12 @@ class SSDAugmentation(object):
         ])
 
     def __call__(self, img, masks, boxes, labels):
-        '''
+
         imgs, maskss, boxess, labelss = self.augment(img, masks, boxes, labels)
         print(type(imgs))
         print(imgs.shape)
-        print(maskss.shape)
-        print("bboxs",boxess)
-        
-
-        mask_s = np.ones((maskss.shape[1],maskss.shape[2],maskss.shape[0]))
-
-        for i in range(maskss.shape[0]):
-            for j in range(maskss.shape[1]):
-                for k in range(maskss.shape[2]):
-
-                    mask_s[j,k,i] = maskss[i,j,k]
-
-        cv2.line(imgs, (int(boxess[0,0]), int(boxess[0,1])), (int(boxess[0,2]),int(boxess[0,3])), (255,0,0), 5)
-
         cv2.imshow('img',imgs)
         cv2.waitKey(0)
-        cv2.imshow('img',mask_s)
-        cv2.waitKey(0)
 
-        '''
+
         return self.augment(img, masks, boxes, labels)
