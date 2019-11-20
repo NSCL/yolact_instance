@@ -78,6 +78,7 @@ if args.dataset is not None:
 # Update training parameters from the config if necessary
 def replace(name):
     if getattr(args, name) == None: setattr(args, name, getattr(cfg, name))
+
 replace('lr')
 replace('decay')
 replace('gamma')
@@ -123,7 +124,6 @@ class ScatterWrapper:
         
         return out_args
 
-        
 
 def train():
     if not os.path.exists(args.save_folder):
@@ -202,6 +202,17 @@ def train():
 
     print('Begin training!')
     print()
+
+    save_loss_txt = []
+    save_total_txt = []
+    with open('loss_data.txt', 'w') as filehandle:
+        for listitem in save_loss_txt:
+            filehandle.write('%s\n' % listitem)
+                    
+    with open('loss_total_data.txt', 'w') as filehandle:
+        for listitem in save_total_txt:
+            filehandle.write('%s\n' % listitem)
+
     # try-except so you can use ctrl+c to save early and stop training
     try:
         for epoch in range(num_epochs):
@@ -281,7 +292,10 @@ def train():
                     
                     total = sum([loss_avgs[k].get_avg() for k in losses])
                     loss_labels = sum([[k, loss_avgs[k].get_avg()] for k in loss_types if k in losses], [])
-                    
+
+                    save_loss_txt.append(loss_labels)
+                    save_total_txt.append(total)
+              
                     print(('[%3d] %7d ||' + (' %s: %.3f |' * len(losses)) + ' T: %.3f || ETA: %s || timer: %.3f')
                             % tuple([epoch, iteration] + loss_labels + [total, eta_str, elapsed]), flush=True)
                 
@@ -298,11 +312,21 @@ def train():
                         if args.keep_latest_interval <= 0 or iteration % args.keep_latest_interval != args.save_interval:
                             print('Deleting old save...')
                             os.remove(latest)
+
+                    with open('loss_data.txt', 'w') as filehandle:
+                        for listitem in save_loss_txt:
+                            filehandle.write('%s\n' % listitem)
+                    
+                    with open('loss_total_data.txt', 'w') as filehandle:
+                        for listitem in save_total_txt:
+                            filehandle.write('%s\n' % listitem)
             
             # This is done per epoch
             if args.validation_epoch > 0:
                 if epoch % args.validation_epoch == 0 and epoch > 0:
                     compute_validation_map(yolact_net, val_dataset)
+
+    
     except KeyboardInterrupt:
         print('Stopping early. Saving network...')
         
