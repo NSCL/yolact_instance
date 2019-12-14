@@ -108,6 +108,8 @@ def parse_args(argv=None):
                         help='If specified, override the dataset specified in the config with this one (example: coco2017_dataset).')
     parser.add_argument('--detect', default=False, dest='detect', action='store_true',
                         help='Don\'t evauluate the mask branch at all and only do object detection. This only works for --display and --benchmark.')
+    parser.add_argument('--find_class', default=None, type=int,
+                        help='class index')
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False)
@@ -232,7 +234,7 @@ def prep_display_mask(dets_out, img, h, w, undo_transform=True, class_color=Fals
                 cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
                 cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
     
-    return img_numpy, masks #check point
+    return img_numpy, masks, classes #check point
 
 def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45):
     """
@@ -667,38 +669,15 @@ def badhash(x):
     x =  ((x >> 16) ^ x) & 0xFFFFFFFF
     return x
 
-
-
-def evalimage(net:Yolact, path:str, save_path:str=None):
-    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
-    batch = FastBaseTransform()(frame.unsqueeze(0))
-    preds = net(batch)
-
-    img_numpy, mask = prep_display_mask(preds, frame, None, None, undo_transform=False)
+def find_com_orientation(mask_data):
     
-    '''
-    h,w,_ = frame.shape
-
-    t = postprocess(preds, w, h, visualize_lincomb = args.display_lincomb,
-                                    crop_masks        = args.crop,
-                                    score_threshold   = args.score_threshold)
-
-    mask = t[3][:args.top_k]
-    '''
-
-    mask_data = mask.cpu()
-    mask_data = mask_data.numpy()
-    mask_data = mask_data.astype(np.int64)
-    mask_data = mask_data * 100
-    
-
     mask_h_sum = 0
     mask_w_sum = 0
     sum_count = 0
 
-    for i in range(0,mask_data.shape[1]):
-        for j in range(0,mask_data.shape[2]):
-            if mask_data[0,i,j,0] != 0:
+    for i in range(0,mask_data.shape[0]):
+        for j in range(0,mask_data.shape[1]):
+            if mask_data[i,j,0] != 0:
                 mask_h_sum += i
                 mask_w_sum += j
                 sum_count += 1
@@ -709,19 +688,11 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     mask_h_index = int(mask_h)
     mask_w_index = int(mask_w)
 
-    print("-----------------------------")
-
-    print("center of mass x :",mask_h_index)
-    print("center of mass y :",mask_w_index)
-
-    mask_data[0,mask_h_index,mask_w_index,0] = 255
-
-    img = mask_data[0,:,:,0]
-    img = mask_data[0,:,:,0]
-  
+    img = mask_data[:,:,0]
+    
     rows = img.shape[0]
     cols = img.shape[1]
-    
+        
     x = np.ones((rows, 1))
     y = np.ones((1, cols))
 
@@ -748,7 +719,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     a_img = f_img * (x * x)
     b_img = f_img * x * y
     c_img = f_img * (y * y)
-    
+        
     a = a_img.sum()
     b = b_img.sum()*2
     c = c_img.sum() 
@@ -758,7 +729,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     if denom == 0:
         thetamin = 2*3.14*random.random(0,1)
         thetamax = 2*3.14*random.random(0,1)
-        
+            
         roundness = 1
 
     else:
@@ -774,13 +745,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
         lmax = 0.5*(c+a) - 0.5*(a-c)*cos2thetamax - 0.5*b*sin2thetamax
 
         roundness = lmin/lmax
-    
-    print("-----------------------------")
-
-    print("thetamin",thetamin)
-
-    print("-----------------------------")
-
+  
     point_x = 50*math.sin(thetamin)
     point_y = 50*math.cos(thetamin)
 
@@ -789,13 +754,111 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
 
     rotation_point_x = int(rotation_point_x)
     rotation_point_y = int(rotation_point_y)
-    
-    mask_data[0,rotation_point_x,rotation_point_y,0] = 255
 
-    #print(point_x, point_y)
-    #print(meanx, meany)
-    #print(rotation_point_x, rotation_point_y)
+    return mask_h_index, mask_w_index, thetamin, rotation_point_x, rotation_point_y
+
+def evalimage_class(net:Yolact, path:str, save_path:str=None, class_index:int=1):
+
+    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
+    batch = FastBaseTransform()(frame.unsqueeze(0))
+    preds = net(batch)
+
+    split_data = save_path.split("/")
+
+    mask_save_path = split_data[0] + "/" + "result_Mask_data" + "/" 
+    mask_roi_save_path = split_data[0] + "/" + "result_Mask_roi_data" + "/"
+    name_split = split_data[1].split("png")
+
+    img_numpy, mask, classes = prep_display_mask(preds, frame, None, None, undo_transform=False)
+
+    classes_data = np.where(classes == class_index)
+    classes_index = classes_data[0]
+
+    origin_img = np.asarray(frame.cpu())
+
+    mask_data = mask.cpu()
+    mask_data = mask_data.numpy()
+    mask_data = mask_data.astype(np.int64)
+    roi_data = mask_data * 1
+    mask_data = mask_data * 255
+
+    if classes_index.size == 1:
+        
+        mask_roi = origin_img * roi_data[classes_index[0],:,:,:]
+        mask_roi_path = mask_roi_save_path + name_split[0] + "mask_" + cfg.dataset.class_names[classes[classes_index[0]]] + ".png"        
+        cv2.imwrite(mask_roi_path, mask_roi)
+
+        mask_h_index, mask_w_index, thetamin, rotation_point_x, rotation_point_y = find_com_orientation(mask_data[classes_index[0],:,:,:])
+        
+        print("-----------------------------")
+        print("select class :", cfg.dataset.class_names[classes[classes_index[0]]])
+        print("-----------------------------")
+        print("center of mass x :",mask_h_index)
+        print("center of mass y :",mask_w_index)
+        print("-----------------------------")
+        print("thetamin",thetamin)
+        print("-----------------------------")
+
+        if save_path is None:
+            img_numpy = img_numpy[:, :, (2, 1, 0)]
+        
+        if save_path is None:
+            plt.imshow(img_numpy)
+            plt.title(path)
+            plt.show()
+        else:
+            cv2.imwrite(save_path, img_numpy)
+                    
+            mask_path = mask_save_path + name_split[0] + "mask_" + cfg.dataset.class_names[classes[classes_index[0]]] + ".png"
+            cv2.imwrite(mask_path, mask_data[classes_index[0],:,:,:])
+    else:
+        print("Failed to find class")
+
+def evalimage(net:Yolact, path:str, save_path:str=None):
+
+    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
+    batch = FastBaseTransform()(frame.unsqueeze(0))
+    preds = net(batch)
+
+    split_data = save_path.split("/")
+
+    mask_save_path = split_data[0] + "/" + "Mask_data" + "/" 
+    mask_roi_save_path = split_data[0] + "/" + "Mask_roi_data" + "/"
+    name_split = split_data[1].split("png")
+
+    img_numpy, mask, classes = prep_display_mask(preds, frame, None, None, undo_transform=False)
+    #img_numpy = prep_display(preds, frame, None, None, undo_transform=False)
+
+    origin_img = np.asarray(frame.cpu())
+
+    mask_data = mask.cpu()
+    mask_data = mask_data.numpy()
+    mask_data = mask_data.astype(np.int64)
+    roi_data = mask_data * 1
+    mask_data = mask_data * 255
+
+    for i in range(mask.shape[0]):
+        mask_roi = origin_img * roi_data[i,:,:,:]
+        mask_roi_path = mask_roi_save_path + name_split[0] + "mask_" + cfg.dataset.class_names[classes[i]] + ".png"        
+        cv2.imwrite(mask_roi_path, mask_roi)
     
+    for mask_index in range(mask.shape[0]):
+        
+        mask_h_index, mask_w_index, thetamin, rotation_point_x, rotation_point_y = find_com_orientation(mask_data[mask_index,:,:,:])
+        print("-----------------------------")
+        print("center of mass x :",mask_h_index)
+        print("center of mass y :",mask_w_index)
+        print("-----------------------------")
+
+        print("thetamin",thetamin)
+
+        print("-----------------------------")
+
+    split_data = save_path.split("/")
+
+    mask_save_path = split_data[0] + "/" + "Mask_data" + "/" 
+    name_split = split_data[1].split("png")
+
     if save_path is None:
         img_numpy = img_numpy[:, :, (2, 1, 0)]
     
@@ -805,8 +868,14 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
         plt.show()
     else:
         cv2.imwrite(save_path, img_numpy)
+                
+        for i in range(mask.shape[0]):
+            mask_path = mask_save_path + name_split[0] + "mask_" + cfg.dataset.class_names[classes[i]] + ".png"
+            cv2.imwrite(mask_path, mask_data[i,:,:,:])
+
+        #cv2.imwrite(save_path, )
         #cv2.imwrite(save_path, mask_data[0,:,:,:])
-    
+        
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str):
     if not os.path.exists(output_folder):
@@ -819,7 +888,11 @@ def evalimages(net:Yolact, input_folder:str, output_folder:str):
         name = '.'.join(name.split('.')[:-1]) + '.png'
         out_path = os.path.join(output_folder, name)
 
-        evalimage(net, path, out_path)
+        if args.find_class is not None:
+            evalimage_class(net, path, out_path, class_index = args.find_class)
+        else:    
+            evalimage(net, path, out_path)
+        
         print(path + ' -> ' + out_path)
     print('Done.')
 
@@ -1023,25 +1096,45 @@ def savevideo(net:Yolact, in_path:str, out_path:str):
 def evaluate(net:Yolact, dataset, train_mode=False):
     net.detect.use_fast_nms = args.fast_nms
     cfg.mask_proto_debug = args.mask_proto_debug
+    if args.find_class is not None:
 
-    if args.image is not None:
-        if ':' in args.image:
-            inp, out = args.image.split(':')
-            evalimage(net, inp, out)
-        else:
-            evalimage(net, args.image)
-        return
-    elif args.images is not None:
-        inp, out = args.images.split(':')
-        evalimages(net, inp, out)
-        return
-    elif args.video is not None:
-        if ':' in args.video:
-            inp, out = args.video.split(':')
-            savevideo(net, inp, out)
-        else:
-            evalvideo(net, args.video)
-        return
+        if args.image is not None:
+            if ':' in args.image:
+                inp, out = args.image.split(':')
+                evalimage_class(net, inp, out, class_index = args.find_class)
+            else:
+                evalimage_class(net, args.image, class_index = args.find_class)
+            return
+        elif args.images is not None:
+            inp, out = args.images.split(':')
+            evalimages(net, inp, out)
+            return
+        elif args.video is not None:
+            if ':' in args.video:
+                inp, out = args.video.split(':')
+                savevideo(net, inp, out)
+            else:
+                evalvideo(net, args.video)
+
+    else :
+        if args.image is not None:
+            if ':' in args.image:
+                inp, out = args.image.split(':')
+                evalimage(net, inp, out)
+            else:
+                evalimage(net, args.image)
+            return
+        elif args.images is not None:
+            inp, out = args.images.split(':')
+            evalimages(net, inp, out)
+            return
+        elif args.video is not None:
+            if ':' in args.video:
+                inp, out = args.video.split(':')
+                savevideo(net, inp, out)
+            else:
+                evalvideo(net, args.video)
+
 
     frame_times = MovingAverage()
     dataset_size = len(dataset) if args.max_images < 0 else min(args.max_images, len(dataset))
@@ -1235,7 +1328,7 @@ if __name__ == '__main__':
                 ap_data = pickle.load(f)
             calc_map(ap_data)
             exit()
-
+        
         if args.image is None and args.video is None and args.images is None:
             dataset = COCODetection(cfg.dataset.valid_images, cfg.dataset.valid_info,
                                     transform=BaseTransform(), has_gt=cfg.dataset.has_gt)
